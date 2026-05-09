@@ -157,6 +157,49 @@ func (s *Session) IsDirty() bool { return s.dirty }
 // ExpiresAt returns the session's expiry time.
 func (s *Session) ExpiresAt() time.Time { return s.expiresAt }
 
+// CreatedAt returns the session's creation time.
+func (s *Session) CreatedAt() time.Time { return s.createdAt }
+
+// Data returns a copy of the session's data map. Useful for serialization
+// in external Store implementations.
+func (s *Session) Data() map[string]any {
+	if len(s.data) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(s.data))
+	for k, v := range s.data {
+		out[k] = v
+	}
+	return out
+}
+
+// FlashData returns a copy of the session's flash data map. Useful for
+// serialization in external Store implementations.
+func (s *Session) FlashData() map[string]any {
+	if len(s.flash) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(s.flash))
+	for k, v := range s.flash {
+		out[k] = v
+	}
+	return out
+}
+
+// Restore reconstructs a Session from serialized components. This is the
+// entry point for external Store implementations (Redis, SQL, etc.) that
+// need to rebuild a Session from stored data. The returned session is not
+// dirty — it represents persisted state.
+func Restore(id string, data, flash map[string]any, createdAt, expiresAt time.Time) *Session {
+	return &Session{
+		id:        id,
+		data:      data,
+		flash:     flash,
+		createdAt: createdAt,
+		expiresAt: expiresAt,
+	}
+}
+
 // ---------- Store interface ---------------------------------------------
 
 // Store is the persistence backend for sessions. The MemoryStore (in this
