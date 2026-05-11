@@ -33,7 +33,8 @@ type CORSOptions struct {
 	ExposedHeaders []string
 
 	// AllowCredentials enables cookies / Authorization on cross-origin
-	// requests. Requires explicit (non-"*") AllowedOrigins.
+	// requests. When AllowedOrigins is ["*"], the specific request origin
+	// is echoed (not "*") so credentials remain spec-compliant.
 	AllowCredentials bool
 
 	// MaxAge is the preflight cache duration in seconds. 0 → omitted.
@@ -84,10 +85,9 @@ func CORS(opts CORSOptions) Middleware {
 					w.Header().Add("Vary", "Origin")
 				}
 
-				if cfg.AllowCredentials && !allowAll {
-					// Per spec, credentials + "*" is forbidden. Skip the
-					// credentials header rather than sending an invalid
-					// combination that browsers will reject anyway.
+				if cfg.AllowCredentials {
+					// When allowAll is true we already echo the specific
+					// origin (not "*") above, so this is spec-compliant.
 					w.Header().Set("Access-Control-Allow-Credentials", "true")
 				}
 				if exposedHeaders != "" {
