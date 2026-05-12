@@ -126,6 +126,9 @@ func (q *Queue) worker(ctx context.Context) {
 			// failures internally before surfacing them here.
 			return
 		}
+		if env == nil {
+			continue
+		}
 
 		q.handle(ctx, env)
 	}
