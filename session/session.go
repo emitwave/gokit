@@ -50,11 +50,12 @@ import (
 // Session is the per-user state container. Mutate via Get/Set/Delete;
 // the manager's middleware persists it after the request completes.
 type Session struct {
-	id        string
-	data      map[string]any
-	flash     map[string]any // values popped on read
-	createdAt time.Time
-	expiresAt time.Time
+	id             string
+	data           map[string]any
+	flash          map[string]any // values popped on read
+	createdAt      time.Time
+	expiresAt      time.Time
+	customLifetime time.Duration
 
 	dirty bool // set when modified; the middleware uses this to decide whether to save
 
@@ -159,6 +160,33 @@ func (s *Session) ExpiresAt() time.Time { return s.expiresAt }
 
 // CreatedAt returns the session's creation time.
 func (s *Session) CreatedAt() time.Time { return s.createdAt }
+
+// SetLifetime overrides the global session lifetime for this session.
+// The custom lifetime is stored in session data so it survives serialization.
+func (s *Session) SetLifetime(d time.Duration) {
+	s.customLifetime = d
+	if s.data == nil {
+		s.data = make(map[string]any)
+	}
+	s.data["_session_lifetime"] = int64(d)
+	s.dirty = true
+}
+
+// Lifetime returns the per-session lifetime override, or 0 if none is set.
+func (s *Session) Lifetime() time.Duration {
+	if s.customLifetime > 0 {
+		return s.customLifetime
+	}
+	if v, ok := s.data["_session_lifetime"]; ok {
+		switch n := v.(type) {
+		case int64:
+			return time.Duration(n)
+		case float64:
+			return time.Duration(int64(n))
+		}
+	}
+	return 0
+}
 
 // Data returns a copy of the session's data map. Useful for serialization
 // in external Store implementations.

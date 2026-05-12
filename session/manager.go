@@ -253,7 +253,12 @@ func (m *Manager) persist(ctx context.Context, w http.ResponseWriter, sess *Sess
 	}
 
 	// Refresh expiry on every save so active sessions don't time out.
-	sess.expiresAt = time.Now().Add(m.lifetime)
+	// Use per-session lifetime if set, otherwise fall back to global default.
+	lifetime := m.lifetime
+	if sl := sess.Lifetime(); sl > 0 {
+		lifetime = sl
+	}
+	sess.expiresAt = time.Now().Add(lifetime)
 
 	if err := m.store.Save(ctx, sess); err != nil {
 		return err
@@ -265,7 +270,7 @@ func (m *Manager) persist(ctx context.Context, w http.ResponseWriter, sess *Sess
 		Path:     m.path,
 		Domain:   m.domain,
 		Expires:  sess.expiresAt,
-		MaxAge:   int(m.lifetime.Seconds()),
+		MaxAge:   int(lifetime.Seconds()),
 		Secure:   m.secure,
 		HttpOnly: m.httpOnly,
 		SameSite: m.sameSite,
