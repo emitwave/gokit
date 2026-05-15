@@ -67,6 +67,11 @@ type Session struct {
 	// destroy is set by Destroy() — middleware deletes from store and
 	// clears the cookie on the response.
 	destroy bool
+
+	// onPersist is called after persist assigns the final session ID.
+	// This lets callers (e.g. session tracking) act on the real ID
+	// instead of the pre-regeneration one.
+	onPersist func(id string)
 }
 
 // ID returns the session's identifier. Empty for unsaved sessions.
@@ -148,6 +153,14 @@ func (s *Session) Regenerate(_ context.Context) {
 // this on logout.
 func (s *Session) Destroy() {
 	s.destroy = true
+	s.dirty = true
+}
+
+// OnPersist registers a callback that fires after persist() saves the
+// session with its final ID. Use this when you need the real session ID
+// (e.g. after Regenerate) rather than the pre-rotation one.
+func (s *Session) OnPersist(fn func(id string)) {
+	s.onPersist = fn
 	s.dirty = true
 }
 

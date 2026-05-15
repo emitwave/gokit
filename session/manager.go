@@ -264,6 +264,12 @@ func (m *Manager) persist(ctx context.Context, w http.ResponseWriter, sess *Sess
 		return err
 	}
 
+	// Invoke post-persist callback with the final session ID.
+	if sess.onPersist != nil {
+		sess.onPersist(sess.id)
+		sess.onPersist = nil
+	}
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     m.cookieName,
 		Value:    sess.id,
