@@ -2,11 +2,30 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
+
+// ConcurrencyLimiter coordinates per-key in-flight job limits across
+// workers — and, when backed by shared storage (e.g. Redis), across
+// processes. Keys come from Envelope.Key; unkeyed jobs bypass the
+// limiter entirely.
+//
+// Acquire errors are treated as fail-open: the job runs unlimited
+// rather than stalling the queue on limiter-store outages.
+type ConcurrencyLimiter interface {
+	// Acquire reserves an in-flight slot for key. Returns false when the
+	// key is at capacity — the queue defers the job (re-enqueues with a
+	// short delay, without consuming a retry attempt).
+	Acquire(ctx context.Context, key string) (bool, error)
+
+	// Release frees a slot previously reserved by a successful Acquire.
+	Release(ctx context.Context, key string)
+}
 
 // Config tunes a Queue. Zero values get production-reasonable defaults.
 type Config struct {
@@ -32,6 +51,15 @@ type Config struct {
 	// logger / error tracker. Default: no-op (failures are silent
 	// otherwise — strongly recommend setting this).
 	ErrorHandler func(env *Envelope, err error, willRetry bool)
+
+	// Limiter enables per-key fairness for keyed jobs (see Envelope.Key
+	// and DispatchKeyed). Nil = no limiting.
+	Limiter ConcurrencyLimiter
+
+	// DeferDelay is the base re-enqueue delay for jobs deferred because
+	// their key is at capacity (actual delay is jittered 0.5x–1.5x so
+	// deferred jobs don't return in lockstep). Default: 2s.
+	DeferDelay time.Duration
 }
 
 // Queue is the high-level API: register handlers, dispatch jobs, run
@@ -66,6 +94,9 @@ func New(backend Backend, cfg Config) *Queue {
 	}
 	if cfg.MaxBackoff <= 0 {
 		cfg.MaxBackoff = 5 * time.Minute
+	}
+	if cfg.DeferDelay <= 0 {
+		cfg.DeferDelay = 2 * time.Second
 	}
 
 	return &Queue{
@@ -130,8 +161,34 @@ func (q *Queue) worker(ctx context.Context) {
 			continue
 		}
 
+		if env.Key != "" && q.cfg.Limiter != nil {
+			ok, lerr := q.cfg.Limiter.Acquire(ctx, env.Key)
+			if lerr == nil {
+				if !ok {
+					q.deferKeyed(ctx, env)
+					continue
+				}
+				q.handle(ctx, env)
+				q.cfg.Limiter.Release(ctx, env.Key)
+				continue
+			}
+			// Limiter store unavailable — fail open and run unlimited.
+		}
+
 		q.handle(ctx, env)
 	}
+}
+
+// deferKeyed re-enqueues a job whose fairness key is at capacity. The
+// deferral is not a retry: Attempt is preserved so capacity waits never
+// eat into the failure budget. Jitter spreads the return of a deferred
+// backlog so one tenant's jobs don't stampede back in lockstep.
+func (q *Queue) deferKeyed(ctx context.Context, env *Envelope) {
+	requeue := *env
+	requeue.ID = ""
+	d := q.cfg.DeferDelay
+	requeue.RunAt = time.Now().Add(d/2 + rand.N(d))
+	_ = q.backend.Push(ctx, &requeue)
 }
 
 // handle runs a single job through its handler, applying retry logic on
@@ -167,6 +224,15 @@ func (q *Queue) handle(ctx context.Context, env *Envelope) {
 		return
 	}
 
+	// Permanent failures skip the retry budget entirely — the handler
+	// has declared no retry can succeed (bad payload, 4xx rejection).
+	var perm *PermanentError
+	if errors.As(handlerErr, &perm) {
+		q.reportError(env, handlerErr, false)
+		_ = q.backend.Fail(ctx, env, handlerErr)
+		return
+	}
+
 	// Retry path.
 	if env.Attempt > env.MaxRetry {
 		// Exhausted — into the dead-letter pile.
@@ -181,10 +247,17 @@ func (q *Queue) handle(ctx context.Context, env *Envelope) {
 	// Re-push with backoff. We do this rather than expecting the backend
 	// to handle retries because the backoff policy belongs to the queue,
 	// not the storage layer — different teams want different curves.
+	// A RetryAfter error overrides the curve with the upstream's own
+	// come-back-later delay (e.g. HTTP 429 retry-after).
+	delay := q.backoff(env.Attempt)
+	var ra *RetryAfterError
+	if errors.As(handlerErr, &ra) && ra.Delay > 0 {
+		delay = ra.Delay
+	}
 	retry := *env
 	retry.ID = ""
 	retry.Attempt = env.Attempt + 1
-	retry.RunAt = time.Now().Add(q.backoff(env.Attempt))
+	retry.RunAt = time.Now().Add(delay)
 	_ = q.backend.Push(ctx, &retry)
 }
 

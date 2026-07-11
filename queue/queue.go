@@ -35,6 +35,7 @@ import (
 type Envelope struct {
 	ID        string    // unique per-job identifier (set by Backend.Push)
 	Type      string    // routing key — matches Register() name
+	Key       string    // optional fairness key (e.g. tenant ID) for Config.Limiter
 	Payload   []byte    // JSON-encoded payload
 	Attempt   int       // 1-based; incremented on retry
 	MaxRetry  int       // 0 = no retries; total attempts = MaxRetry + 1
@@ -106,10 +107,22 @@ func DispatchAfter[T any](ctx context.Context, q *Queue, jobType string, payload
 	return DispatchWithOpts(ctx, q, jobType, payload, DispatchOptions{RunAt: time.Now().Add(delay)})
 }
 
+// DispatchKeyed enqueues like Dispatch but tags the job with a fairness
+// key (typically a tenant/org ID). When the queue is configured with a
+// ConcurrencyLimiter, jobs sharing a key are capped at the limiter's
+// per-key concurrency so one tenant's backlog can't monopolize workers.
+func DispatchKeyed[T any](ctx context.Context, q *Queue, jobType string, payload T, key string) error {
+	return DispatchWithOpts(ctx, q, jobType, payload, DispatchOptions{Key: key})
+}
+
 // DispatchOptions configures a single Dispatch call.
 type DispatchOptions struct {
 	// RunAt is the earliest time the job may execute. Zero = now.
 	RunAt time.Time
+
+	// Key tags the job with a fairness key for per-key concurrency
+	// limiting. Empty = unkeyed (never deferred by the limiter).
+	Key string
 
 	// MaxRetry overrides the queue-level default. Set to -1 to disable
 	// retries for this specific job, or to a positive value to permit
@@ -134,6 +147,7 @@ func DispatchWithOpts[T any](ctx context.Context, q *Queue, jobType string, payl
 	}
 	return q.backend.Push(ctx, &Envelope{
 		Type:     jobType,
+		Key:      opts.Key,
 		Payload:  body,
 		MaxRetry: maxRetry,
 		RunAt:    opts.RunAt,

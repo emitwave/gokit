@@ -247,3 +247,151 @@ func TestBackoffCaps(t *testing.T) {
 		t.Errorf("expected cap at 3s, got %v", got)
 	}
 }
+
+func TestPermanentErrorSkipsRetries(t *testing.T) {
+	backend := NewMemoryBackend()
+	defer backend.Close()
+	q := New(backend, Config{Workers: 1, MaxRetry: 5, BaseBackoff: 5 * time.Millisecond})
+
+	var attempts atomic.Int32
+	failed := make(chan struct{})
+	q.cfg.ErrorHandler = func(env *Envelope, err error, willRetry bool) {
+		if willRetry {
+			t.Error("permanent error must not be retried")
+		}
+		close(failed)
+	}
+	q.Register("doomed", func(_ context.Context, _ []byte) error {
+		attempts.Add(1)
+		return Permanent(errors.New("bad payload"))
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go q.Run(ctx)
+
+	_ = Dispatch(ctx, q, "doomed", struct{}{})
+
+	select {
+	case <-failed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not fail within 2s")
+	}
+	time.Sleep(50 * time.Millisecond) // would-be retry window
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("expected exactly 1 attempt, got %d", got)
+	}
+	if n := len(backend.FailedJobs()); n != 1 {
+		t.Errorf("expected 1 dead-lettered job, got %d", n)
+	}
+}
+
+func TestRetryAfterOverridesBackoff(t *testing.T) {
+	backend := NewMemoryBackend()
+	defer backend.Close()
+	// Base backoff is far larger than the RetryAfter delay: if the retry
+	// arrives quickly, the override took effect.
+	q := New(backend, Config{Workers: 1, MaxRetry: 1, BaseBackoff: 10 * time.Second})
+
+	var attempts atomic.Int32
+	done := make(chan struct{})
+	q.Register("throttled", func(_ context.Context, _ []byte) error {
+		if attempts.Add(1) == 1 {
+			return RetryAfter(errors.New("429"), 10*time.Millisecond)
+		}
+		close(done)
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go q.Run(ctx)
+
+	_ = Dispatch(ctx, q, "throttled", struct{}{})
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retry did not honor RetryAfter delay (still on 10s backoff?)")
+	}
+}
+
+// gateLimiter admits every key except "big-org", which is capped at 0
+// (always deferred) until released.
+type gateLimiter struct {
+	mu       sync.Mutex
+	open     bool
+	deferred atomic.Int32
+	released atomic.Int32
+}
+
+func (g *gateLimiter) Acquire(_ context.Context, key string) (bool, error) {
+	if key != "big-org" {
+		return true, nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.open {
+		g.deferred.Add(1)
+		return false, nil
+	}
+	return true, nil
+}
+
+func (g *gateLimiter) Release(_ context.Context, _ string) { g.released.Add(1) }
+
+func TestKeyedJobsDeferredAtCapacity(t *testing.T) {
+	backend := NewMemoryBackend()
+	defer backend.Close()
+	gate := &gateLimiter{}
+	q := New(backend, Config{Workers: 2, BaseBackoff: 5 * time.Millisecond, Limiter: gate, DeferDelay: 10 * time.Millisecond})
+
+	bigDone := make(chan struct{})
+	smallDone := make(chan struct{})
+	q.Register("work", func(_ context.Context, payload []byte) error {
+		var p struct{ Org string }
+		_ = json.Unmarshal(payload, &p)
+		if p.Org == "big" {
+			close(bigDone)
+		} else {
+			close(smallDone)
+		}
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go q.Run(ctx)
+
+	_ = DispatchKeyed(ctx, q, "work", struct{ Org string }{"big"}, "big-org")
+	_ = DispatchKeyed(ctx, q, "work", struct{ Org string }{"small"}, "small-org")
+
+	// The small org's job completes while the big org is gated.
+	select {
+	case <-smallDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unkeyed-capacity org was starved by a gated key")
+	}
+	select {
+	case <-bigDone:
+		t.Fatal("gated job ran before capacity freed")
+	default:
+	}
+	if gate.deferred.Load() == 0 {
+		t.Error("expected at least one deferral for the gated key")
+	}
+
+	// Open the gate: the deferred job comes back and completes, with a
+	// matching Release for the successful Acquire.
+	gate.mu.Lock()
+	gate.open = true
+	gate.mu.Unlock()
+	select {
+	case <-bigDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred job never ran after capacity freed")
+	}
+	if gate.released.Load() == 0 {
+		t.Error("expected Release after handling a keyed job")
+	}
+}
